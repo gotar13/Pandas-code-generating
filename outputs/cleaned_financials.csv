@@ -1,0 +1,5 @@
+price_usd_per_kg,cost_per_ha,crop,baseline_yield_kg_per_ha
+0.28,520,corn,8200
+0.24,480,wheat,7000
+0.35,450,soy,3600
+0.22,470,barley,6200

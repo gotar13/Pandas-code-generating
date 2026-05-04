@@ -1,12 +1,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
 import pandera as pa
 from pandera import Check, Column, DataFrameSchema
+
+
+DEFAULT_SPRAY_LOGS_CSV = Path(__file__).resolve().parent / "data" / "raw" / "spray_logs_500.csv"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 
 
 CANONICAL_LOG_COLUMNS = {
@@ -171,6 +176,10 @@ def synthesize_data(
 	financials = _apply_aliases(financials, fin_aliases)
 
 	return {"spray_logs": logs, "weather": weather, "financials": financials}
+
+
+def load_spray_logs(source_path: Path | str = DEFAULT_SPRAY_LOGS_CSV) -> pd.DataFrame:
+	return pd.read_csv(source_path)
 
 
 def standardize_columns(df: pd.DataFrame, alias_map: Dict[str, Iterable[str]]) -> pd.DataFrame:
@@ -342,21 +351,30 @@ def merge_data(
 	financials: pd.DataFrame,
 	weather_tolerance: str = "2h",
 ) -> pd.DataFrame:
-	# Drop rows with missing join keys and ensure both frames are sorted
-	# by the grouping key (`field_id`) then by the time key for merge_asof.
+	# Merge per field to keep merge_asof's ordering rules simple and reliable.
 	logs_sorted = logs.dropna(subset=["timestamp"]).sort_values(["field_id", "timestamp"]).reset_index(drop=True)
 	weather_sorted = weather.dropna(subset=["weather_time"]).sort_values(["field_id", "weather_time"]).reset_index(drop=True)
 
-	# Align each log with the most recent prior weather reading.
-	merged = pd.merge_asof(
-		logs_sorted,
-		weather_sorted,
-		left_on="timestamp",
-		right_on="weather_time",
-		by="field_id",
-		tolerance=pd.Timedelta(weather_tolerance),
-		direction="backward",
-	)
+	merged_parts = []
+	for field_id, log_group in logs_sorted.groupby("field_id", sort=False):
+		weather_group = weather_sorted[weather_sorted["field_id"] == field_id]
+		if weather_group.empty:
+			matched = log_group.copy()
+			for col in ["weather_time", "ingest_time", "wind_speed_mps", "temperature_c", "humidity"]:
+				if col not in matched.columns:
+					matched[col] = pd.NA
+		else:
+			matched = pd.merge_asof(
+				log_group.sort_values("timestamp"),
+				weather_group.sort_values("weather_time"),
+				left_on="timestamp",
+				right_on="weather_time",
+				tolerance=pd.Timedelta(weather_tolerance),
+				direction="backward",
+			)
+		merged_parts.append(matched)
+
+	merged = pd.concat(merged_parts, ignore_index=True)
 
 	merged = merged.merge(financials, on="crop", how="left")
 	return merged
@@ -412,19 +430,51 @@ def orchestration_plan() -> Dict[str, str]:
 	}
 
 
-def run_pipeline(n_records: int = 800, seed: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def save_pipeline_outputs(
+	logs: pd.DataFrame,
+	weather: pd.DataFrame,
+	financials: pd.DataFrame,
+	metrics: pd.DataFrame,
+	output_dir: Path | str = DEFAULT_OUTPUT_DIR,
+) -> Dict[str, Path]:
+	output_path = Path(output_dir)
+	output_path.mkdir(parents=True, exist_ok=True)
+
+	paths = {
+		"cleaned_spray_logs": output_path / "cleaned_spray_logs.csv",
+		"cleaned_weather": output_path / "cleaned_weather.csv",
+		"cleaned_financials": output_path / "cleaned_financials.csv",
+		"final_metrics": output_path / "final_metrics.csv",
+	}
+
+	logs.to_csv(paths["cleaned_spray_logs"], index=False)
+	weather.to_csv(paths["cleaned_weather"], index=False)
+	financials.to_csv(paths["cleaned_financials"], index=False)
+	metrics.to_csv(paths["final_metrics"], index=False)
+	return paths
+
+
+def run_pipeline(
+	n_records: int = 800,
+	seed: int = 42,
+	spray_logs_path: Path | str = DEFAULT_SPRAY_LOGS_CSV,
+	output_dir: Path | str | None = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 	data = synthesize_data(n_records=n_records, seed=seed)
-	logs = clean_spray_logs(data["spray_logs"])
+	logs_source = load_spray_logs(spray_logs_path) if Path(spray_logs_path).exists() else data["spray_logs"]
+	logs = clean_spray_logs(logs_source)
 	weather = clean_weather(data["weather"])
 	financials = clean_financials(data["financials"])
 	validate_data(logs, weather, financials)
 
 	merged = merge_data(logs, weather, financials)
 	metrics = compute_metrics(merged)
+	if output_dir is not None:
+		save_pipeline_outputs(logs, weather, financials, metrics, output_dir=output_dir)
 	return logs, weather, metrics
 
 
 if __name__ == "__main__":
-	_, _, metrics_df = run_pipeline()
+	_, _, metrics_df = run_pipeline(output_dir=DEFAULT_OUTPUT_DIR)
 	print(metrics_df.head())
 
