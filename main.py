@@ -1,0 +1,430 @@
+
+from __future__ import annotations
+
+from typing import Dict, Iterable, Tuple
+
+import numpy as np
+import pandas as pd
+import pandera as pa
+from pandera import Check, Column, DataFrameSchema
+
+
+CANONICAL_LOG_COLUMNS = {
+	"log_id",
+	"farm_id",
+	"field_id",
+	"timestamp",
+	"crop",
+	"equipment",
+	"operator_id",
+	"area_ha",
+	"dosage_value",
+	"dosage_unit",
+	"spray_cost_cents",
+	"yield_kg",
+}
+
+CANONICAL_WEATHER_COLUMNS = {
+	"field_id",
+	"weather_time",
+	"ingest_time",
+	"wind_speed_mps",
+	"temperature_c",
+	"humidity",
+}
+
+CANONICAL_FIN_COLUMNS = {
+	"crop",
+	"price_usd_per_kg",
+	"baseline_yield_kg_per_ha",
+	"cost_per_ha",
+}
+
+
+# Alias maps simulate schema drift by renaming canonical fields.
+LOG_ALIASES = {
+	"timestamp": ["timestamp", "event_time", "logged_at"],
+	"dosage_value": ["dosage_value", "dose_val", "dosage_raw"],
+	"dosage_unit": ["dosage_unit", "dose_unit", "unit"],
+	"spray_cost_cents": ["spray_cost_cents", "spray_cost_cent", "spray_cost"],
+	"yield_kg": ["yield_kg", "yield_kgs", "yield_mass"],
+}
+
+WEATHER_ALIASES = {
+	"weather_time": ["weather_time", "obs_time", "timestamp"],
+	"wind_speed_mps": ["wind_speed_mps", "wind_mps", "wind_speed"],
+	"temperature_c": ["temperature_c", "temp_c", "temperature"],
+	"humidity": ["humidity", "rh", "rel_humidity"],
+}
+
+FIN_ALIASES = {
+	"price_usd_per_kg": ["price_usd_per_kg", "price", "price_usd"],
+	"baseline_yield_kg_per_ha": ["baseline_yield_kg_per_ha", "baseline_yield"],
+	"cost_per_ha": ["cost_per_ha", "cost_ha", "cost"],
+}
+
+
+def _choose_aliases(rng: np.random.Generator, alias_map: Dict[str, Iterable[str]]) -> Dict[str, str]:
+	return {key: rng.choice(list(values)) for key, values in alias_map.items()}
+
+
+def _apply_aliases(df: pd.DataFrame, alias_map: Dict[str, str]) -> pd.DataFrame:
+	columns = {canonical: alias for canonical, alias in alias_map.items() if canonical in df.columns}
+	return df.rename(columns=columns)
+
+
+def synthesize_data(
+	n_records: int = 800,
+	seed: int = 42,
+) -> Dict[str, pd.DataFrame]:
+	rng = np.random.default_rng(seed)
+
+	farm_ids = rng.choice(["F-100", "F-200", "F-300"], size=n_records)
+	field_ids = rng.choice(["Field-A", "Field-B", "Field-C", "Field-D"], size=n_records)
+	base_time = pd.Timestamp("2025-01-01")
+	timestamps = base_time + pd.to_timedelta(rng.integers(0, 60 * 60 * 24 * 90, size=n_records), unit="s")
+
+	crops = rng.choice(["corn", "wheat", "soy", "barley"], size=n_records)
+	equipment = rng.choice(["sprayer-x", "sprayer-y", "sprayer-z"], size=n_records)
+	operator_id = rng.integers(1000, 1030, size=n_records)
+	area_ha = rng.uniform(5.0, 60.0, size=n_records)
+
+	dosage_value = rng.normal(1.2, 0.35, size=n_records)
+	dosage_value = np.clip(dosage_value, 0.2, 3.5)
+	dosage_unit = rng.choice(
+		["l_per_ha", "ml_per_m2", "gal_per_acre"],
+		size=n_records,
+		p=[0.8, 0.15, 0.05],
+	)
+
+	spray_cost_cents = (dosage_value * area_ha * rng.uniform(120, 180, size=n_records)).astype(int)
+	yield_kg = (area_ha * rng.uniform(2000, 5000, size=n_records) + rng.normal(0, 200, size=n_records)).astype(int)
+
+	log_id = rng.integers(200000, 300000, size=n_records)
+
+	logs = pd.DataFrame(
+		{
+			"log_id": log_id,
+			"farm_id": farm_ids,
+			"field_id": field_ids,
+			"timestamp": timestamps,
+			"crop": crops,
+			"equipment": equipment,
+			"operator_id": operator_id,
+			"area_ha": area_ha,
+			"dosage_value": dosage_value,
+			"dosage_unit": dosage_unit,
+			"spray_cost_cents": spray_cost_cents,
+			"yield_kg": yield_kg,
+		}
+	)
+
+	# Seed duplicates to simulate late-arriving or retried log uploads.
+	dup_idx = rng.choice(logs.index, size=max(5, n_records // 40), replace=False)
+	logs = pd.concat([logs, logs.loc[dup_idx]], ignore_index=True)
+
+	# Inject missing dosage values to test null handling.
+	missing_mask = rng.random(size=len(logs)) < 0.03
+	logs.loc[missing_mask, "dosage_value"] = np.nan
+
+	# Random casing drift in equipment labels.
+	logs.loc[rng.random(size=len(logs)) < 0.05, "equipment"] = logs["equipment"].str.upper()
+
+	log_aliases = _choose_aliases(rng, LOG_ALIASES)
+	logs = _apply_aliases(logs, log_aliases)
+
+	weather_time = pd.date_range(base_time, base_time + pd.Timedelta(days=90), freq="30min")
+	weather = pd.DataFrame(
+		{
+			"field_id": rng.choice(["Field-A", "Field-B", "Field-C", "Field-D"], size=len(weather_time)),
+			"weather_time": weather_time,
+			"wind_speed_mps": np.clip(rng.normal(4.5, 1.8, size=len(weather_time)), 0, 20),
+			"temperature_c": rng.normal(18, 6, size=len(weather_time)),
+			"humidity": np.clip(rng.normal(0.6, 0.15, size=len(weather_time)), 0.2, 0.98),
+		}
+	)
+
+	# Separate ingest time to mimic delayed ingestion vs observation time.
+	weather["ingest_time"] = weather["weather_time"] + pd.to_timedelta(
+		rng.integers(0, 60 * 60 * 12, size=len(weather)), unit="s"
+	)
+
+	# Duplicate a slice with a later ingest_time to simulate late arrivals.
+	late_idx = rng.choice(weather.index, size=30, replace=False)
+	late_records = weather.loc[late_idx].copy()
+	late_records["ingest_time"] += pd.Timedelta(hours=24)
+	weather = pd.concat([weather, late_records], ignore_index=True)
+
+	weather_aliases = _choose_aliases(rng, WEATHER_ALIASES)
+	weather = _apply_aliases(weather, weather_aliases)
+
+	financials = pd.DataFrame(
+		{
+			"crop": ["corn", "wheat", "soy", "barley"],
+			"price_usd_per_kg": [0.28, 0.24, 0.35, 0.22],
+			"baseline_yield_kg_per_ha": [8200, 7000, 3600, 6200],
+			"cost_per_ha": [520, 480, 450, 470],
+		}
+	)
+
+	fin_aliases = _choose_aliases(rng, FIN_ALIASES)
+	financials = _apply_aliases(financials, fin_aliases)
+
+	return {"spray_logs": logs, "weather": weather, "financials": financials}
+
+
+def standardize_columns(df: pd.DataFrame, alias_map: Dict[str, Iterable[str]]) -> pd.DataFrame:
+	# Reverse alias map to canonical column names.
+	reverse_map = {}
+	for canonical, aliases in alias_map.items():
+		for alias in aliases:
+			reverse_map[alias] = canonical
+	return df.rename(columns=reverse_map)
+
+
+def convert_dosage_to_l_per_ha(values: pd.Series, units: pd.Series) -> pd.Series:
+	factors = {
+		"l_per_ha": 1.0,
+		# 1 ml/m2 = 10 l/ha
+		"ml_per_m2": 10.0,
+		# 1 gal/acre -> l/ha
+		"gal_per_acre": 3.78541 / 0.404686,
+	}
+	unit_factors = units.map(factors).fillna(1.0)
+	return values.astype(float) * unit_factors
+
+
+def remove_outliers_iqr(df: pd.DataFrame, columns: Iterable[str], k: float = 1.5) -> pd.DataFrame:
+	filtered = df.copy()
+	for col in columns:
+		series = filtered[col].dropna()
+		if series.empty:
+			continue
+		# IQR filter keeps values within k * IQR of the quartiles.
+		q1 = series.quantile(0.25)
+		q3 = series.quantile(0.75)
+		iqr = q3 - q1
+		if iqr == 0:
+			continue
+		lower = q1 - k * iqr
+		upper = q3 + k * iqr
+		filtered = filtered[(filtered[col].isna()) | ((filtered[col] >= lower) & (filtered[col] <= upper))]
+	return filtered
+
+
+def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+	optimized = df.copy()
+	# Reduce memory for large frames before joins.
+	# Explicitly include both 'object' and 'string' dtypes to be compatible
+	# with pandas' upcoming string migration (silences Pandas4Warning).
+	for col in optimized.select_dtypes(include=["object", "string"]).columns:
+		optimized[col] = optimized[col].astype("category")
+	for col in optimized.select_dtypes(include=["float64"]).columns:
+		optimized[col] = pd.to_numeric(optimized[col], downcast="float")
+	for col in optimized.select_dtypes(include=["int64"]).columns:
+		optimized[col] = pd.to_numeric(optimized[col], downcast="integer")
+	return optimized
+
+
+def clean_spray_logs(df: pd.DataFrame) -> pd.DataFrame:
+	cleaned = standardize_columns(df, LOG_ALIASES)
+	cleaned = cleaned[list(CANONICAL_LOG_COLUMNS & set(cleaned.columns))].copy()
+
+	cleaned["timestamp"] = pd.to_datetime(cleaned["timestamp"], errors="coerce")
+	cleaned["equipment"] = cleaned["equipment"].astype(str).str.strip().str.lower()
+	cleaned["crop"] = cleaned["crop"].astype(str).str.strip().str.lower()
+
+	cleaned["dosage_value"] = pd.to_numeric(cleaned["dosage_value"], errors="coerce")
+	cleaned["area_ha"] = pd.to_numeric(cleaned["area_ha"], errors="coerce")
+	cleaned["yield_kg"] = pd.to_numeric(cleaned["yield_kg"], errors="coerce")
+	cleaned["spray_cost_cents"] = pd.to_numeric(cleaned["spray_cost_cents"], errors="coerce")
+
+	# Normalize dosage into a single unit for analysis.
+	cleaned["dosage_l_per_ha"] = convert_dosage_to_l_per_ha(
+		cleaned["dosage_value"], cleaned["dosage_unit"]
+	)
+	cleaned["spray_cost_usd"] = cleaned["spray_cost_cents"] / 100.0
+	cleaned["yield_kg_per_ha"] = cleaned["yield_kg"] / cleaned["area_ha"]
+
+	# Keep one row per log_id after synthesis duplicates.
+	cleaned = cleaned.drop_duplicates(subset=["log_id"])
+	cleaned = remove_outliers_iqr(cleaned, ["dosage_l_per_ha", "yield_kg_per_ha"])
+
+	cleaned = optimize_dtypes(cleaned)
+	return cleaned
+
+
+def clean_weather(df: pd.DataFrame) -> pd.DataFrame:
+	cleaned = standardize_columns(df, WEATHER_ALIASES)
+	cleaned = cleaned[list(CANONICAL_WEATHER_COLUMNS & set(cleaned.columns))].copy()
+
+	cleaned["weather_time"] = pd.to_datetime(cleaned["weather_time"], errors="coerce")
+	cleaned["ingest_time"] = pd.to_datetime(cleaned["ingest_time"], errors="coerce")
+
+	for col in ["wind_speed_mps", "temperature_c", "humidity"]:
+		cleaned[col] = pd.to_numeric(cleaned[col], errors="coerce")
+
+	cleaned = remove_outliers_iqr(cleaned, ["wind_speed_mps", "temperature_c"])
+	cleaned = optimize_dtypes(cleaned)
+	return cleaned
+
+
+def clean_financials(df: pd.DataFrame) -> pd.DataFrame:
+	cleaned = standardize_columns(df, FIN_ALIASES)
+	cleaned = cleaned[list(CANONICAL_FIN_COLUMNS & set(cleaned.columns))].copy()
+	cleaned["crop"] = cleaned["crop"].astype(str).str.strip().str.lower()
+	for col in ["price_usd_per_kg", "baseline_yield_kg_per_ha", "cost_per_ha"]:
+		cleaned[col] = pd.to_numeric(cleaned[col], errors="coerce")
+	cleaned = optimize_dtypes(cleaned)
+	return cleaned
+
+
+def logs_schema() -> DataFrameSchema:
+	return DataFrameSchema(
+		{
+			"log_id": Column(int, nullable=False),
+			"farm_id": Column(str, nullable=False),
+			"field_id": Column(str, nullable=False),
+			"timestamp": Column(pa.DateTime, nullable=False),
+			"crop": Column(str, nullable=False),
+			"equipment": Column(str, nullable=False),
+			"operator_id": Column(int, nullable=False),
+			"area_ha": Column(float, Check.in_range(0.5, 200), nullable=False),
+			"dosage_l_per_ha": Column(float, Check.in_range(0.1, 25), nullable=True),
+			"spray_cost_usd": Column(float, Check.ge(0), nullable=True),
+			"yield_kg": Column(float, Check.ge(0), nullable=True),
+			"yield_kg_per_ha": Column(float, Check.in_range(100, 15000), nullable=True),
+		},
+		strict=False,
+		coerce=True,
+		# Enforce a null-rate threshold for dosage after cleaning.
+		checks=[Check(lambda df: df["dosage_l_per_ha"].isna().mean() < 0.1)],
+	)
+
+
+def weather_schema() -> DataFrameSchema:
+	return DataFrameSchema(
+		{
+			"field_id": Column(str, nullable=False),
+			"weather_time": Column(pa.DateTime, nullable=False),
+			"ingest_time": Column(pa.DateTime, nullable=True),
+			"wind_speed_mps": Column(float, Check.in_range(0, 30), nullable=True),
+			"temperature_c": Column(float, Check.in_range(-15, 45), nullable=True),
+			"humidity": Column(float, Check.in_range(0.1, 1.0), nullable=True),
+		},
+		strict=False,
+		coerce=True,
+	)
+
+
+def financials_schema() -> DataFrameSchema:
+	return DataFrameSchema(
+		{
+			"crop": Column(str, nullable=False),
+			"price_usd_per_kg": Column(float, Check.in_range(0.05, 5.0), nullable=False),
+			"baseline_yield_kg_per_ha": Column(float, Check.in_range(500, 15000), nullable=False),
+			"cost_per_ha": Column(float, Check.in_range(10, 3000), nullable=False),
+		},
+		strict=False,
+		coerce=True,
+	)
+
+
+def validate_data(logs: pd.DataFrame, weather: pd.DataFrame, financials: pd.DataFrame) -> None:
+	logs_schema().validate(logs, lazy=True)
+	weather_schema().validate(weather, lazy=True)
+	financials_schema().validate(financials, lazy=True)
+
+
+def merge_data(
+	logs: pd.DataFrame,
+	weather: pd.DataFrame,
+	financials: pd.DataFrame,
+	weather_tolerance: str = "2h",
+) -> pd.DataFrame:
+	# Drop rows with missing join keys and ensure both frames are sorted
+	# by the grouping key (`field_id`) then by the time key for merge_asof.
+	logs_sorted = logs.dropna(subset=["timestamp"]).sort_values(["field_id", "timestamp"]).reset_index(drop=True)
+	weather_sorted = weather.dropna(subset=["weather_time"]).sort_values(["field_id", "weather_time"]).reset_index(drop=True)
+
+	# Align each log with the most recent prior weather reading.
+	merged = pd.merge_asof(
+		logs_sorted,
+		weather_sorted,
+		left_on="timestamp",
+		right_on="weather_time",
+		by="field_id",
+		tolerance=pd.Timedelta(weather_tolerance),
+		direction="backward",
+	)
+
+	merged = merged.merge(financials, on="crop", how="left")
+	return merged
+
+
+def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
+	enriched = df.copy()
+	revenue_per_ha = enriched["yield_kg_per_ha"] * enriched["price_usd_per_kg"]
+	spray_cost_per_ha = enriched["spray_cost_usd"] / enriched["area_ha"]
+	enriched["cost_per_spray"] = enriched["spray_cost_usd"]
+	enriched["yield_delta"] = enriched["yield_kg_per_ha"] - enriched["baseline_yield_kg_per_ha"]
+	# Profit margin normalized by revenue per ha.
+	enriched["profit_margin"] = (revenue_per_ha - spray_cost_per_ha - enriched["cost_per_ha"]) / revenue_per_ha
+	# Proxy for wasted spray due to wind.
+	enriched["wind_waste_proxy"] = enriched["wind_speed_mps"] * enriched["dosage_l_per_ha"]
+	return enriched
+
+
+def compute_correlations(df: pd.DataFrame) -> pd.Series:
+	cols = ["wind_speed_mps", "wind_waste_proxy", "dosage_l_per_ha", "profit_margin"]
+	return df[cols].corr().stack().sort_values(ascending=False)
+
+
+def create_plots(df: pd.DataFrame) -> None:
+	import seaborn as sns
+	import matplotlib.pyplot as plt
+
+	sns.regplot(data=df, x="wind_speed_mps", y="wind_waste_proxy")
+	plt.title("Wind Speed vs Waste Proxy")
+	plt.show()
+
+	sns.regplot(data=df, x="dosage_l_per_ha", y="profit_margin")
+	plt.title("Dosage Precision vs Profit")
+	plt.show()
+
+	sns.boxplot(data=df, x="crop", y="profit_margin")
+	plt.title("ROI by Crop")
+	plt.show()
+
+
+def scalability_recommendation(rows: int, daily_ingestion: bool) -> str:
+	if rows >= 10_000_000 or daily_ingestion:
+		return "Use Polars or PySpark for compute, and BigQuery/Snowflake + dbt for storage."
+	return "Pandas is sufficient; consider Polars for lazy optimization when nearing 10M rows."
+
+
+def orchestration_plan() -> Dict[str, str]:
+	return {
+		"prefect": "Rapid deployment and Python-first workflows.",
+		"airflow": "Enterprise DAGs with strong scheduler ecosystem.",
+		"dagster": "Asset-centric orchestration with lineage and checks.",
+		"monitoring": "Alert on schema drift using pandera checks and run logs.",
+	}
+
+
+def run_pipeline(n_records: int = 800, seed: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+	data = synthesize_data(n_records=n_records, seed=seed)
+	logs = clean_spray_logs(data["spray_logs"])
+	weather = clean_weather(data["weather"])
+	financials = clean_financials(data["financials"])
+	validate_data(logs, weather, financials)
+
+	merged = merge_data(logs, weather, financials)
+	metrics = compute_metrics(merged)
+	return logs, weather, metrics
+
+
+if __name__ == "__main__":
+	_, _, metrics_df = run_pipeline()
+	print(metrics_df.head())
+
