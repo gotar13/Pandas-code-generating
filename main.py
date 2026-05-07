@@ -79,32 +79,62 @@ def _apply_aliases(df: pd.DataFrame, alias_map: Dict[str, str]) -> pd.DataFrame:
 
 
 def synthesize_data(
-	n_records: int = 800,
+	n_records: int = 500,
 	seed: int = 42,
 ) -> Dict[str, pd.DataFrame]:
+	"""
+	Generate realistic spray logs with three farm profiles:
+	- F-100: Struggling farm (high wind waste, poor practices, low yield)
+	- F-200: Average farm (moderate performance)
+	- F-300: High performer (efficient, lower costs, better yields)
+	"""
 	rng = np.random.default_rng(seed)
-
-	farm_ids = rng.choice(["F-100", "F-200", "F-300"], size=n_records)
-	field_ids = rng.choice(["Field-A", "Field-B", "Field-C", "Field-D"], size=n_records)
 	base_time = pd.Timestamp("2025-01-01")
-	timestamps = base_time + pd.to_timedelta(rng.integers(0, 60 * 60 * 24 * 90, size=n_records), unit="s")
 
+	# Create farm profile assignments
+	farm_distribution = np.array(["F-100"] * (n_records // 3) + 
+	                               ["F-200"] * (n_records // 3) + 
+	                               ["F-300"] * (n_records - 2 * (n_records // 3)))
+	rng.shuffle(farm_distribution)
+
+	farm_ids = farm_distribution
+	field_ids = rng.choice(["Field-A", "Field-B", "Field-C", "Field-D"], size=n_records)
+	timestamps = base_time + pd.to_timedelta(rng.integers(0, 60 * 60 * 24 * 90, size=n_records), unit="s")
 	crops = rng.choice(["corn", "wheat", "soy", "barley"], size=n_records)
-	equipment = rng.choice(["sprayer-x", "sprayer-y", "sprayer-z"], size=n_records)
 	operator_id = rng.integers(1000, 1030, size=n_records)
 	area_ha = rng.uniform(5.0, 60.0, size=n_records)
 
-	dosage_value = rng.normal(1.2, 0.35, size=n_records)
-	dosage_value = np.clip(dosage_value, 0.2, 3.5)
+	# Farm-specific spray patterns
+	dosage_value = np.zeros(n_records)
+	equipment = np.zeros(n_records, dtype=object)
+	spray_cost_cents = np.zeros(n_records)
+	yield_kg = np.zeros(n_records)
+
+	for i, farm_id in enumerate(farm_ids):
+		if farm_id == "F-100":
+			# Struggling farm: high dosage (overcompensation), expensive, low yield
+			dosage_value[i] = np.clip(rng.normal(2.0, 0.5, 1)[0], 0.8, 3.5)
+			equipment[i] = rng.choice(["sprayer-x", "sprayer-x", "sprayer-y"], p=[0.6, 0.3, 0.1])
+			spray_cost_cents[i] = (dosage_value[i] * area_ha[i] * rng.uniform(180, 220)).astype(int)
+			yield_kg[i] = (area_ha[i] * rng.uniform(1500, 2800) + rng.normal(0, 300)).astype(int)
+		elif farm_id == "F-200":
+			# Average farm: moderate dosage, moderate cost, moderate yield
+			dosage_value[i] = np.clip(rng.normal(1.2, 0.3, 1)[0], 0.5, 2.5)
+			equipment[i] = rng.choice(["sprayer-x", "sprayer-y", "sprayer-z"], p=[0.33, 0.33, 0.34])
+			spray_cost_cents[i] = (dosage_value[i] * area_ha[i] * rng.uniform(140, 180)).astype(int)
+			yield_kg[i] = (area_ha[i] * rng.uniform(3000, 4500) + rng.normal(0, 200)).astype(int)
+		else:  # F-300
+			# High performer: efficient dosage, low cost, high yield
+			dosage_value[i] = np.clip(rng.normal(0.9, 0.2, 1)[0], 0.3, 1.8)
+			equipment[i] = rng.choice(["sprayer-y", "sprayer-z", "sprayer-z"], p=[0.2, 0.4, 0.4])
+			spray_cost_cents[i] = (dosage_value[i] * area_ha[i] * rng.uniform(100, 140)).astype(int)
+			yield_kg[i] = (area_ha[i] * rng.uniform(4000, 5500) + rng.normal(0, 150)).astype(int)
+
 	dosage_unit = rng.choice(
 		["l_per_ha", "ml_per_m2", "gal_per_acre"],
 		size=n_records,
 		p=[0.8, 0.15, 0.05],
 	)
-
-	spray_cost_cents = (dosage_value * area_ha * rng.uniform(120, 180, size=n_records)).astype(int)
-	yield_kg = (area_ha * rng.uniform(2000, 5000, size=n_records) + rng.normal(0, 200, size=n_records)).astype(int)
-
 	log_id = rng.integers(200000, 300000, size=n_records)
 
 	logs = pd.DataFrame(
@@ -120,34 +150,54 @@ def synthesize_data(
 			"dosage_value": dosage_value,
 			"dosage_unit": dosage_unit,
 			"spray_cost_cents": spray_cost_cents,
-			"yield_kg": yield_kg,
+			"yield_kg": yield_kg.astype(int),
 		}
 	)
 
-	# Seed duplicates to simulate late-arriving or retried log uploads.
-	dup_idx = rng.choice(logs.index, size=max(5, n_records // 40), replace=False)
-	logs = pd.concat([logs, logs.loc[dup_idx]], ignore_index=True)
+	# Seed duplicates (more common in struggling farm)
+	struggling_indices = logs[logs["farm_id"] == "F-100"].index
+	dup_count = max(10, n_records // 25)
+	if len(struggling_indices) > 0:
+		dup_idx = rng.choice(struggling_indices, size=min(dup_count // 2, len(struggling_indices)), replace=False)
+		logs = pd.concat([logs, logs.loc[dup_idx]], ignore_index=True)
 
-	# Inject missing dosage values to test null handling.
-	missing_mask = rng.random(size=len(logs)) < 0.03
-	logs.loc[missing_mask, "dosage_value"] = np.nan
+	# Inject missing dosage values (more in struggling farm)
+	for farm_id, miss_rate in [("F-100", 0.08), ("F-200", 0.03), ("F-300", 0.01)]:
+		farm_mask = logs["farm_id"] == farm_id
+		missing_idx = logs[farm_mask].sample(frac=miss_rate, random_state=rng, replace=False).index
+		logs.loc[missing_idx, "dosage_value"] = np.nan
 
-	# Random casing drift in equipment labels.
-	logs.loc[rng.random(size=len(logs)) < 0.05, "equipment"] = logs["equipment"].str.upper()
+	# Random casing drift (more common in struggling farm)
+	for farm_id, drift_rate in [("F-100", 0.12), ("F-200", 0.05), ("F-300", 0.02)]:
+		farm_mask = logs["farm_id"] == farm_id
+		drift_idx = logs[farm_mask].sample(frac=drift_rate, random_state=rng, replace=False).index
+		logs.loc[drift_idx, "equipment"] = logs.loc[drift_idx, "equipment"].str.upper()
 
 	log_aliases = _choose_aliases(rng, LOG_ALIASES)
 	logs = _apply_aliases(logs, log_aliases)
 
+	# Weather data: make it more realistic with higher wind for struggling farms
 	weather_time = pd.date_range(base_time, base_time + pd.Timedelta(days=90), freq="30min")
-	weather = pd.DataFrame(
-		{
-			"field_id": rng.choice(["Field-A", "Field-B", "Field-C", "Field-D"], size=len(weather_time)),
-			"weather_time": weather_time,
-			"wind_speed_mps": np.clip(rng.normal(4.5, 1.8, size=len(weather_time)), 0, 20),
-			"temperature_c": rng.normal(18, 6, size=len(weather_time)),
-			"humidity": np.clip(rng.normal(0.6, 0.15, size=len(weather_time)), 0.2, 0.98),
-		}
-	)
+	weather_df_list = []
+	
+	for field_id in ["Field-A", "Field-B", "Field-C", "Field-D"]:
+		field_weather_times = weather_time
+		field_weather_records = len(field_weather_times)
+		
+		# Higher wind variability overall
+		wind_speed_base = np.clip(rng.normal(5.2, 2.2, size=field_weather_records), 0.5, 25)
+		
+		weather_df_list.append(pd.DataFrame(
+			{
+				"field_id": field_id,
+				"weather_time": field_weather_times,
+				"wind_speed_mps": wind_speed_base,
+				"temperature_c": rng.normal(16, 7, size=field_weather_records),
+				"humidity": np.clip(rng.normal(0.58, 0.18, size=field_weather_records), 0.15, 0.99),
+			}
+		))
+	
+	weather = pd.concat(weather_df_list, ignore_index=True)
 
 	# Separate ingest time to mimic delayed ingestion vs observation time.
 	weather["ingest_time"] = weather["weather_time"] + pd.to_timedelta(
